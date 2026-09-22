@@ -6,7 +6,9 @@ ISO 8601 时间戳的温度读数与允许区间，服务端：
 1. 按时间排序读数；
 2. 用**滞回阈值（hysteresis）**识别连续超温事件，避免临界值附近抖动产生碎片；
 3. 将超过采样间隔上限的**缺测**切成独立片段；
-4. 返回时间轴上每段的起止时间、峰值、缺测标记与是否合规。
+4. 返回时间轴上每段的起止时间、峰值、缺测标记与是否合规；
+5. 可对报告做**封存（seal）**：按固定字段顺序与 UTC 格式生成 canonical JSON
+   并固化 SHA-256 摘要，之后随时通过只读校验接口发现报告是否被改动。
 
 默认零配置：SQLite 文件库、WAL 模式、启动自动建表，**无需任何第三方账号**。
 
@@ -16,11 +18,12 @@ ISO 8601 时间戳的温度读数与允许区间，服务端：
 
 ```
 app/
-  main.py       # FastAPI 入口、路由、启动初始化（lifespan 建表）
+  main.py       # FastAPI 入口、路由、启动初始化（lifespan 建表/迁移）
   audit.py      # 审计核心引擎：滞回状态机 + 缺测切片
+  seal.py       # 报告封存：canonical JSON（固定字段顺序、UTC）与 SHA-256
   schemas.py    # 请求/响应模型与参数校验
-  crud.py       # 批次写入与报告查询
-  database.py   # sqlite3 连接、建表脚本、WAL/外键
+  crud.py       # 批次写入、报告查询、封存与校验
+  database.py   # sqlite3 连接、建表脚本、WAL/外键、封存列幂等迁移
   config.py     # 环境变量配置
 tests/          # pytest 引擎与 API 测试
 Dockerfile
@@ -151,6 +154,57 @@ normal → high_excursion(峰值 9.1°C，3 个样本) → missing(3600s) → no
 curl http://localhost:8000/batches/TRUCK-A-001/report
 ```
 
+### `POST /batches/{batch_ref}/seal` —— 封存报告摘要（幂等）
+
+对整份审计报告（批次字段 + 全部片段）生成 **canonical JSON** 并计算
+**SHA-256** 摘要，首次调用时把摘要与 `sealed_at`（UTC）固化到批次记录中。
+
+canonical JSON 规则：
+
+- 顶层与每个片段都使用**固定字段顺序**（即报告响应中的字段顺序，
+  `segments` 排最后；片段为 `index, type, start_time, end_time,
+  duration_seconds, sample_count, peak_temperature_c, peak_at,
+  max_temperature_c, min_temperature_c, missing, compliant`）；
+- 所有时间戳归一化为 **UTC、`Z` 后缀**的 ISO 8601；
+- 紧凑序列化（无多余空白、`ensure_ascii=False`、不按键名排序）。
+
+**重复调用完全幂等**：已封存的批次不会重算或覆盖，返回与首次相同的
+`digest` / `sealed_digest` / `sealed_at`（响应状态码仍为 `200`）。
+批次不存在返回 `404`。
+
+```bash
+curl -X POST http://localhost:8000/batches/TRUCK-A-001/seal
+```
+
+```json
+{
+  "id": "…",
+  "external_ref": "TRUCK-A-001",
+  "sealed": true,
+  "sealed_at": "2026-09-22T09:40:00.123456Z",
+  "digest": "5b747c6d…7c0d22ec",
+  "sealed_digest": "5b747c6d…7c0d22ec"
+}
+```
+
+### `GET /batches/{batch_ref}/verify` —— 校验封存摘要（只读）
+
+按当前持久化数据**重新计算**报告摘要，与封存时固化的摘要比对：
+
+| 字段 | 含义 |
+| --- | --- |
+| `digest` | 当前报告的 SHA-256 摘要 |
+| `sealed_digest` | 封存时固化的摘要；批次尚未封存时为 `null` |
+| `sealed_at` | 封存时间（UTC）；尚未封存时为 `null` |
+| `valid` | `sealed_digest` 存在且与 `digest` 一致时为 `true`；不一致或未封存为 `false` |
+
+校验接口**只读**：即使当前数据与封存摘要不一致（`valid=false`），也不会修改
+任何审计数据或封存记录；此时再次 `POST …/seal` 仍返回最初固化的摘要。
+
+```bash
+curl http://localhost:8000/batches/TRUCK-A-001/verify
+```
+
 ### `GET /batches` —— 批次列表（摘要）
 
 查询参数：`compliant=true|false`（可选过滤）、`limit`（1–200，默认 50）、
@@ -176,11 +230,18 @@ pytest -q
 
 测试覆盖：排序、滞回不分裂抖动事件、边界严格比较、缺测独立切片
 （含“等于上限不算缺测”）、高/低温峰值、单读数片段、API 提交/报告/重复 409/
-404/422/列表过滤与时区归一化。
+404/422/列表过滤与时区归一化；封存侧覆盖 canonical JSON 的固定字段顺序、
+UTC 归一、摘要随数据变化、封存幂等（重复调用 sealed_at/digest 不变）、
+未封存与篡改后 `valid=false` 且校验不回写数据、未知批次 404。
 
 ## 设计说明
 
 - **写时审计**：提交时一次性计算并持久化片段，报告查询为纯读取，结果可追溯。
+- **封存只读校验**：`sealed_at`/`sealed_digest` 仅在首次 `seal` 时写入
+  （`UPDATE … WHERE sealed_digest IS NULL`，并发下也不会重复固化）；`verify`
+  只做读取与重算，摘要不一致时返回 `valid=false` 但绝不改动审计数据。
+- **版本兼容**：启动 lifespan 自动幂等建表，并为旧版本库 `ALTER TABLE`
+  补齐 `sealed_at` / `sealed_digest` 两列（旧批次默认未封存）。
 - **SQLite**：标准库 `sqlite3`，开启 WAL（并发读不阻塞写）与外键级联删除；
   批次、读数、片段三张表并建立索引。
 - **纯函数引擎**：`app/audit.py` 不依赖 Web/DB 框架，输入排序后的读数，

@@ -14,7 +14,14 @@ from fastapi.responses import RedirectResponse
 
 from . import crud
 from .database import get_db, init_db
-from .schemas import BatchCreate, BatchList, BatchReport, BatchSummary
+from .schemas import (
+    BatchCreate,
+    BatchList,
+    BatchReport,
+    BatchSeal,
+    BatchSummary,
+    BatchVerify,
+)
 
 
 @asynccontextmanager
@@ -26,7 +33,7 @@ async def lifespan(app: FastAPI) -> Iterator[None]:
 
 app = FastAPI(
     title="冷链温度合规审计 API",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "提交按批次组织的 ISO 时间戳温度读数，服务端排序后使用滞回阈值"
         "识别连续超温事件，并将超过采样间隔上限的缺测切成独立片段。"
@@ -106,3 +113,41 @@ def get_batch_report(
             detail=f"batch not found: {batch_ref}",
         )
     return report
+
+
+@app.post(
+    "/batches/{batch_ref}/seal",
+    response_model=BatchSeal,
+    tags=["batches"],
+    summary="封存批次报告摘要（幂等：重复调用返回同一份摘要与 sealed_at）",
+)
+def seal_batch(
+    batch_ref: str,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> dict:
+    sealed = crud.seal_batch(conn, batch_ref)
+    if sealed is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"batch not found: {batch_ref}",
+        )
+    return sealed
+
+
+@app.get(
+    "/batches/{batch_ref}/verify",
+    response_model=BatchVerify,
+    tags=["batches"],
+    summary="校验当前报告与封存摘要是否一致（只读，不修改审计数据）",
+)
+def verify_batch(
+    batch_ref: str,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> dict:
+    verification = crud.verify_batch(conn, batch_ref)
+    if verification is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"batch not found: {batch_ref}",
+        )
+    return verification

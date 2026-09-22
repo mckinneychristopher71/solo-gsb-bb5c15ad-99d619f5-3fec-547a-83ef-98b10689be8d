@@ -6,7 +6,7 @@ import sqlite3
 import uuid
 from datetime import datetime, timezone
 
-from . import audit
+from . import audit, seal
 from .schemas import BatchCreate, to_utc
 
 
@@ -234,3 +234,83 @@ def list_batches(
         for row in rows
     ]
     return items, total
+
+
+def seal_batch(conn: sqlite3.Connection, batch_ref: str) -> dict | None:
+    """首次封存：计算并保存报告摘要与 sealed_at；重复调用返回同一份封存记录。
+
+    批次不存在返回 None。封存是幂等的：已有摘要时绝不覆盖 sealed_at/digest。
+    """
+
+    row = conn.execute(
+        "SELECT id FROM batches WHERE id = ? OR external_ref = ?",
+        (batch_ref, batch_ref),
+    ).fetchone()
+    if row is None:
+        return None
+    batch_id = row["id"]
+
+    with conn:
+        existing = conn.execute(
+            "SELECT sealed_at, sealed_digest FROM batches WHERE id = ?",
+            (batch_id,),
+        ).fetchone()
+        if existing["sealed_digest"] is None:
+            report = get_report(conn, batch_id)
+            assert report is not None
+            digest = seal.report_digest(report)
+            sealed_at = _utc_iso(datetime.now(timezone.utc))
+            # 仅在仍未封存时写入，避免并发重复封存导致 sealed_at 漂移。
+            conn.execute(
+                """
+                UPDATE batches
+                   SET sealed_at = ?, sealed_digest = ?
+                 WHERE id = ? AND sealed_digest IS NULL
+                """,
+                (sealed_at, digest, batch_id),
+            )
+
+    sealed = conn.execute(
+        "SELECT id, external_ref, sealed_at, sealed_digest FROM batches WHERE id = ?",
+        (batch_id,),
+    ).fetchone()
+    return {
+        "id": sealed["id"],
+        "external_ref": sealed["external_ref"],
+        "sealed": True,
+        "sealed_at": sealed["sealed_at"],
+        "sealed_digest": sealed["sealed_digest"],
+        "digest": sealed["sealed_digest"],
+    }
+
+
+def verify_batch(conn: sqlite3.Connection, batch_ref: str) -> dict | None:
+    """重新计算当前报告摘要并与封存摘要比对。
+
+    只读操作：任何情况下都不修改审计数据。尚未封存时 sealed_digest 为 null、
+    valid 为 false。
+    """
+
+    row = conn.execute(
+        """
+        SELECT id, external_ref, sealed_at, sealed_digest
+          FROM batches
+         WHERE id = ? OR external_ref = ?
+        """,
+        (batch_ref, batch_ref),
+    ).fetchone()
+    if row is None:
+        return None
+
+    report = get_report(conn, row["id"])
+    assert report is not None
+    digest = seal.report_digest(report)
+    sealed_digest = row["sealed_digest"]
+    return {
+        "id": row["id"],
+        "external_ref": row["external_ref"],
+        "sealed_at": row["sealed_at"],
+        "digest": digest,
+        "sealed_digest": sealed_digest,
+        "valid": sealed_digest is not None and sealed_digest == digest,
+    }

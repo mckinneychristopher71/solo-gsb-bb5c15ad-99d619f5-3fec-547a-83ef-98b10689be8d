@@ -29,7 +29,9 @@ CREATE TABLE IF NOT EXISTS batches (
     reading_count           INTEGER NOT NULL,
     high_excursion_count    INTEGER NOT NULL,
     low_excursion_count     INTEGER NOT NULL,
-    missing_segment_count   INTEGER NOT NULL
+    missing_segment_count   INTEGER NOT NULL,
+    sealed_at               TEXT,
+    sealed_digest           TEXT
 );
 
 CREATE TABLE IF NOT EXISTS readings (
@@ -79,10 +81,24 @@ def _connect() -> sqlite3.Connection:
 
 
 def init_db() -> None:
-    """创建数据目录与全部表（幂等）。"""
+    """创建数据目录与全部表（幂等），并为旧版本库补齐封存列。"""
 
     with _connect() as connection:
         connection.executescript(_SCHEMA)
+        # 旧版本数据库中 batches 表没有封存列，CREATE TABLE IF NOT EXISTS
+        # 不会修改既有表结构，这里做一次幂等的轻量迁移。
+        existing_columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(batches)")
+        }
+        if "sealed_at" not in existing_columns:
+            connection.execute(
+                "ALTER TABLE batches ADD COLUMN sealed_at TEXT"
+            )
+        if "sealed_digest" not in existing_columns:
+            connection.execute(
+                "ALTER TABLE batches ADD COLUMN sealed_digest TEXT"
+            )
 
 
 @contextmanager

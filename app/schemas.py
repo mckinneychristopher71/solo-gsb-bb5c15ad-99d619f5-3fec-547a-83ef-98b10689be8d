@@ -144,6 +144,33 @@ class BatchList(BaseModel):
     offset: int
 
 
+class BatchSeal(BaseModel):
+    id: str
+    external_ref: str
+    sealed: bool
+    sealed_at: datetime
+    digest: str = Field(..., description="封存时保存的 canonical JSON SHA-256 摘要")
+    sealed_digest: str = Field(
+        ..., description="同 digest：首次封存时固化的摘要，重复调用保持不变"
+    )
+
+
+class BatchVerify(BaseModel):
+    id: str
+    external_ref: str
+    sealed_at: datetime | None = Field(
+        ..., description="封存时间（UTC）；尚未封存时为 null"
+    )
+    digest: str = Field(..., description="按当前报告重新计算的 SHA-256 摘要")
+    sealed_digest: str | None = Field(
+        ..., description="封存时固化的摘要；尚未封存时为 null"
+    )
+    valid: bool = Field(
+        ...,
+        description="当前摘要与封存摘要一致为 true；不一致或未封存为 false",
+    )
+
+
 def to_utc(value: datetime) -> datetime:
     """将时间戳统一换算到 UTC（naive 输入按 UTC 解释）。"""
 

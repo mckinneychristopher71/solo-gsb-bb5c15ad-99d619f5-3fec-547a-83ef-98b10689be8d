@@ -1,5 +1,9 @@
 FROM python:3.11-slim
 
+LABEL org.opencontainers.image.title="coldchain-audit" \
+      org.opencontainers.image.description="冷链温度合规审计 API（含报告封存摘要 seal/verify）" \
+      org.opencontainers.image.version="1.1.0"
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \

@@ -144,6 +144,33 @@ class BatchList(BaseModel):
     offset: int
 
 
+class BatchSeal(BaseModel):
+    """封存摘要：首次封存保存摘要与 sealed_at，重复调用返回同一结果。"""
+
+    id: str
+    external_ref: str
+    digest_algorithm: str
+    digest: str
+    sealed_at: datetime
+    canonical: dict
+
+
+class SealVerification(BaseModel):
+    """封存校验：重新计算当前报告摘要并与封存摘要比对。
+
+    校验为只读操作，valid=false 时也不会改动任何审计数据。
+    未封存的批次 sealed_digest / sealed_at 为 null，valid 恒为 false。
+    """
+
+    id: str
+    external_ref: str
+    digest_algorithm: str
+    digest: str
+    sealed_digest: str | None
+    sealed_at: datetime | None
+    valid: bool
+
+
 def to_utc(value: datetime) -> datetime:
     """将时间戳统一换算到 UTC（naive 输入按 UTC 解释）。"""
 

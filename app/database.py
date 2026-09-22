@@ -60,6 +60,14 @@ CREATE TABLE IF NOT EXISTS segments (
     UNIQUE(batch_id, idx)
 );
 
+CREATE TABLE IF NOT EXISTS batch_seals (
+    batch_id        TEXT PRIMARY KEY REFERENCES batches(id) ON DELETE CASCADE,
+    sealed_at       TEXT NOT NULL,
+    canonical_json  TEXT NOT NULL,
+    digest          TEXT NOT NULL,
+    digest_algorithm TEXT NOT NULL DEFAULT 'sha256'
+);
+
 CREATE INDEX IF NOT EXISTS idx_readings_batch_time
     ON readings(batch_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_segments_batch

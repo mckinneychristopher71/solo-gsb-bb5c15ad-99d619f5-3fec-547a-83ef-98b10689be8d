@@ -3,6 +3,10 @@ services:
     build: .
     image: coldchain-audit:latest
     container_name: coldchain-audit
+    labels:
+      org.opencontainers.image.title: "coldchain-audit"
+      org.opencontainers.image.description: "冷链温度合规审计 API（含报告封存摘要 seal/verify）"
+      org.opencontainers.image.version: "1.1.0"
     ports:
       - "8000:8000"
     environment:
@@ -11,6 +15,7 @@ services:
       # COLDCHAIN_DEFAULT_HYSTERESIS: "0.5"
       # COLDCHAIN_DEFAULT_MAX_INTERVAL: "900"
     volumes:
+      # 批次、读数、片段与封存摘要（batch_seals 表）均持久化在此卷
       - coldchain-data:/data
     restart: unless-stopped
     healthcheck:

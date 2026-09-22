@@ -1,12 +1,13 @@
-"""数据库读写：批次提交（写入读数与审计片段）与报告查询。"""
+"""数据库读写：批次提交（写入读数与审计片段）、报告查询与封存摘要。"""
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import uuid
 from datetime import datetime, timezone
 
-from . import audit
+from . import audit, sealing
 from .schemas import BatchCreate, to_utc
 
 
@@ -173,15 +174,23 @@ def _row_to_report(row: sqlite3.Row, segments: list[sqlite3.Row]) -> dict:
     }
 
 
+def _fetch_batch_row(
+    conn: sqlite3.Connection, batch_ref: str
+) -> sqlite3.Row | None:
+    """按批次 ID 或 external_ref 定位批次行。"""
+
+    return conn.execute(
+        "SELECT * FROM batches WHERE id = ? OR external_ref = ?",
+        (batch_ref, batch_ref),
+    ).fetchone()
+
+
 def get_report(
     conn: sqlite3.Connection, batch_ref: str
 ) -> dict | None:
     """按批次 ID 或 external_ref 获取完整审计报告。"""
 
-    row = conn.execute(
-        "SELECT * FROM batches WHERE id = ? OR external_ref = ?",
-        (batch_ref, batch_ref),
-    ).fetchone()
+    row = _fetch_batch_row(conn, batch_ref)
     if row is None:
         return None
 
@@ -190,6 +199,111 @@ def get_report(
         (row["id"],),
     ).fetchall()
     return _row_to_report(row, segments)
+
+
+def _row_to_seal(batch_row: sqlite3.Row, seal_row: sqlite3.Row) -> dict:
+    return {
+        "id": batch_row["id"],
+        "external_ref": batch_row["external_ref"],
+        "digest_algorithm": seal_row["digest_algorithm"],
+        "digest": seal_row["digest"],
+        "sealed_at": seal_row["sealed_at"],
+        "canonical": json.loads(seal_row["canonical_json"]),
+    }
+
+
+def seal_report(conn: sqlite3.Connection, batch_ref: str) -> dict | None:
+    """首次封存报告摘要并记录 sealed_at；重复调用幂等返回同一结果。
+
+    封存后摘要不可变：重复调用不会覆盖已保存的 digest / canonical_json /
+    sealed_at。批次不存在时返回 None。
+    """
+
+    batch_row = _fetch_batch_row(conn, batch_ref)
+    if batch_row is None:
+        return None
+
+    with conn:
+        existing = conn.execute(
+            "SELECT * FROM batch_seals WHERE batch_id = ?",
+            (batch_row["id"],),
+        ).fetchone()
+        if existing is None:
+            segments = conn.execute(
+                "SELECT * FROM segments WHERE batch_id = ? ORDER BY idx",
+                (batch_row["id"],),
+            ).fetchall()
+            report = _row_to_report(batch_row, segments)
+            canonical_json, digest = sealing.canonical_summary(report)
+            sealed_at = _utc_iso(datetime.now(timezone.utc))
+            # INSERT OR IGNORE：并发首次封存时只有一方写入，保证幂等不报错。
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO batch_seals (
+                    batch_id, sealed_at, canonical_json, digest,
+                    digest_algorithm
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    batch_row["id"],
+                    sealed_at,
+                    canonical_json,
+                    digest,
+                    sealing.DIGEST_ALGORITHM,
+                ),
+            )
+
+        # 统一以库中已存在的封存记录为准返回。
+        seal_row = conn.execute(
+            "SELECT * FROM batch_seals WHERE batch_id = ?",
+            (batch_row["id"],),
+        ).fetchone()
+
+    assert seal_row is not None  # 刚插入或必然存在
+    return _row_to_seal(batch_row, seal_row)
+
+
+def get_verification(conn: sqlite3.Connection, batch_ref: str) -> dict | None:
+    """重新计算当前报告摘要并与封存摘要比对。
+
+    只读操作：无论是否一致都不会修改批次、读数、片段或封存记录。
+    返回中的 ``sealed_at`` / ``sealed_digest`` 在未封存时为 None，
+    此时 ``valid`` 恒为 False。
+    """
+
+    batch_row = _fetch_batch_row(conn, batch_ref)
+    if batch_row is None:
+        return None
+
+    segments = conn.execute(
+        "SELECT * FROM segments WHERE batch_id = ? ORDER BY idx",
+        (batch_row["id"],),
+    ).fetchall()
+    _, digest = sealing.canonical_summary(_row_to_report(batch_row, segments))
+
+    seal_row = conn.execute(
+        "SELECT * FROM batch_seals WHERE batch_id = ?",
+        (batch_row["id"],),
+    ).fetchone()
+
+    if seal_row is None:
+        sealed_digest = None
+        sealed_at = None
+        valid = False
+    else:
+        sealed_digest = seal_row["digest"]
+        sealed_at = seal_row["sealed_at"]
+        valid = digest == sealed_digest
+
+    return {
+        "id": batch_row["id"],
+        "external_ref": batch_row["external_ref"],
+        "digest_algorithm": sealing.DIGEST_ALGORITHM,
+        "digest": digest,
+        "sealed_digest": sealed_digest,
+        "sealed_at": sealed_at,
+        "valid": valid,
+    }
 
 
 def list_batches(
